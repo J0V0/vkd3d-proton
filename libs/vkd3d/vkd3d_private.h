@@ -64,8 +64,8 @@
 #define VKD3D_MAX_MUTABLE_DESCRIPTOR_TYPES 6u
 #define VKD3D_MAX_DESCRIPTOR_SIZE 256u /* Maximum allowed value in VK_EXT_descriptor_buffer/heap. */
 
-#define VKD3D_MIN_VIEW_DESCRIPTOR_COUNT (1000000u)
-#define VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT (2048u)
+#define VKD3D_MIN_VIEW_DESCRIPTOR_COUNT D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2
+#define VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE
 
 #define VKD3D_TILE_SIZE (65536ull)
 
@@ -362,6 +362,12 @@ struct vkd3d_va_range
     VkDeviceSize size;
 };
 
+struct vkd3d_descriptor_heap_mapping
+{
+    uintptr_t va;
+    size_t range;
+};
+
 struct vkd3d_va_map
 {
     struct vkd3d_va_tree va_tree;
@@ -371,6 +377,14 @@ struct vkd3d_va_map
     struct vkd3d_unique_resource **small_entries;
     size_t small_entries_size;
     size_t small_entries_count;
+
+    struct vkd3d_descriptor_heap_mapping *resource_mappings;
+    size_t resource_mappings_count;
+    size_t resource_mappings_size;
+
+    struct vkd3d_descriptor_heap_mapping *sampler_mappings;
+    size_t sampler_mappings_count;
+    size_t sampler_mappings_size;
 };
 
 union vkd3d_opacity_micromap
@@ -395,6 +409,12 @@ union vkd3d_opacity_micromap vkd3d_va_map_place_opacity_micromap(struct vkd3d_va
         VkDeviceAddress va);
 void vkd3d_va_map_init(struct vkd3d_va_map *va_map);
 void vkd3d_va_map_cleanup(struct vkd3d_va_map *va_map);
+void vkd3d_va_map_insert_descriptor_heap(struct vkd3d_va_map *va_map,
+        uintptr_t va, size_t range, D3D12_DESCRIPTOR_HEAP_TYPE type);
+void vkd3d_va_map_remove_descriptor_heap(struct vkd3d_va_map *va_map,
+        uintptr_t va, D3D12_DESCRIPTOR_HEAP_TYPE type);
+size_t vkd3d_va_map_query_descriptor_heap_offset(struct vkd3d_va_map *va_map,
+        uintptr_t va, D3D12_DESCRIPTOR_HEAP_TYPE type);
 
 struct vkd3d_private_store
 {
@@ -1673,6 +1693,8 @@ void d3d12_descriptor_heap_dec_ref(struct d3d12_descriptor_heap *heap);
 
 uint32_t d3d12_descriptor_heap_allocate_meta_index(struct d3d12_descriptor_heap *heap);
 void d3d12_descriptor_heap_free_meta_index(struct d3d12_descriptor_heap *heap, uint32_t index);
+uint32_t d3d12_device_find_shader_visible_descriptor_heap_offset(
+        struct d3d12_device *device, vkd3d_cpu_descriptor_va_t va, D3D12_DESCRIPTOR_HEAP_TYPE type);
 
 static inline struct d3d12_descriptor_heap *impl_from_ID3D12DescriptorHeap(ID3D12DescriptorHeap *iface)
 {
@@ -2068,8 +2090,6 @@ unsigned int d3d12_root_signature_get_shader_interface_flags(const struct d3d12_
         enum vkd3d_pipeline_type pipeline_type);
 HRESULT d3d12_root_signature_create_local_static_samplers_layout(struct d3d12_root_signature *root_signature,
         VkDescriptorSetLayout vk_set_layout, VkPipelineLayout *vk_pipeline_layout);
-HRESULT d3d12_root_signature_create_work_graph_layout(struct d3d12_root_signature *root_signature,
-        VkDescriptorSetLayout *vk_push_set_layout, VkPipelineLayout *vk_pipeline_layout);
 HRESULT vkd3d_create_pipeline_layout(struct d3d12_device *device,
         unsigned int set_layout_count, const VkDescriptorSetLayout *set_layouts,
         unsigned int push_constant_count, const VkPushConstantRange *push_constants,
@@ -4441,6 +4461,7 @@ enum vkd3d_bindless_flags
     VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA = (1u << 10),
     VKD3D_BINDLESS_MUTABLE_TYPE_SPLIT_RAW_TYPED     = (1u << 11),
     VKD3D_BINDLESS_HEAP                             = (1u << 12),
+    VKD3D_BINDLESS_NULL_BUFFER_SIBLINGS             = (1u << 13),
 };
 
 #define VKD3D_BINDLESS_SET_MAX_EXTRA_BINDINGS 8
@@ -6333,6 +6354,8 @@ struct vkd3d_fused_root_signature_mappings
 };
 
 struct vkd3d_fused_root_signature_mappings *d3d12_state_object_fuse_root_signature_mappings(
+        struct d3d12_root_signature *global, struct d3d12_root_signature *local);
+struct vkd3d_fused_root_signature_mappings *d3d12_state_object_build_workgraph_root_signature_mappings(
         struct d3d12_root_signature *global, struct d3d12_root_signature *local);
 
 static inline struct d3d12_rt_state_object *rt_impl_from_ID3D12StateObject(ID3D12StateObject *iface)

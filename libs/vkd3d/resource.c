@@ -6338,7 +6338,10 @@ static void vkd3d_create_buffer_srv_heap(vkd3d_cpu_descriptor_va_t desc_va,
 
         is_typed = desc->Format && !(desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW);
 
-        can_emit_sibling_typed_raw = bindless->packed_raw_buffer_offset >= bindless->heap.uniform_texel_buffer_size;
+        /* We'll get a cleared stack descriptor instead. For workaround purposes, this does what we need. */
+        can_emit_sibling_typed_raw =
+                bindless->packed_raw_buffer_offset >= bindless->heap.uniform_texel_buffer_size &&
+                !(bindless->flags & VKD3D_BINDLESS_NULL_BUFFER_SIBLINGS);
 
         if (!is_typed && !d3d12_resource_desc_supports_heap_raw_srv_ssbo(device, desc))
         {
@@ -6418,6 +6421,9 @@ static void vkd3d_create_buffer_srv_embedded(vkd3d_cpu_descriptor_va_t desc_va,
     VkDescriptorAddressInfoEXT addr_info;
     struct d3d12_desc_split_embedded d;
     VkDescriptorGetInfoEXT get_info;
+    bool emit_typed;
+    bool emit_ssbo;
+    bool is_typed;
 
     if (!desc)
     {
@@ -6459,11 +6465,15 @@ static void vkd3d_create_buffer_srv_embedded(vkd3d_cpu_descriptor_va_t desc_va,
             desc->Format, desc->Buffer.FirstElement, desc->Buffer.NumElements,
             desc->Buffer.StructureByteStride, &view);
 
+    is_typed = desc->Format && !(desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW);
+    emit_typed = is_typed || !(device->bindless_state.flags & VKD3D_BINDLESS_NULL_BUFFER_SIBLINGS);
+    emit_ssbo = !is_typed || !(device->bindless_state.flags & VKD3D_BINDLESS_NULL_BUFFER_SIBLINGS);
+
     /* Emit SSBO. */
     get_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT;
     get_info.pNext = NULL;
     get_info.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    get_info.data.pStorageBuffer = &addr_info;
+    get_info.data.pStorageBuffer = emit_ssbo ? &addr_info : NULL;
     addr_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT;
     addr_info.pNext = NULL;
     addr_info.address = view.va;
@@ -6475,29 +6485,34 @@ static void vkd3d_create_buffer_srv_embedded(vkd3d_cpu_descriptor_va_t desc_va,
 
     /* Emit texel buffer alias. */
     get_info.type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
-    get_info.data.pUniformTexelBuffer = &addr_info;
-    addr_info.format = vkd3d_internal_get_vk_format(device, view.dxgi_format);
-    /* If we really intended to emit raw buffers, the fallback will be inferred as R32_UINT. */
-    if (addr_info.format == VK_FORMAT_UNDEFINED)
-    {
-        /* Raw buffer is always emitted as R32_UINT on native.
-         * Try to match behavior observed on native drivers as close as possible here. */
-        if (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW)
-        {
-            addr_info.format = VK_FORMAT_R32_UINT;
-        }
-        else
-        {
-            addr_info.format = vkd3d_internal_get_vk_format(device,
-                    vkd3d_structured_srv_to_texel_buffer_dxgi_format(desc->Buffer.StructureByteStride));
+    get_info.data.pUniformTexelBuffer = emit_typed ? &addr_info : NULL;
 
-            if (!addr_info.format)
+    if (emit_typed)
+    {
+        addr_info.format = vkd3d_internal_get_vk_format(device, view.dxgi_format);
+        /* If we really intended to emit raw buffers, the fallback will be inferred as R32_UINT. */
+        if (addr_info.format == VK_FORMAT_UNDEFINED)
+        {
+            /* Raw buffer is always emitted as R32_UINT on native.
+             * Try to match behavior observed on native drivers as close as possible here. */
+            if (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW)
             {
-                addr_info.address = 0u;
-                addr_info.range = VK_WHOLE_SIZE;
+                addr_info.format = VK_FORMAT_R32_UINT;
+            }
+            else
+            {
+                addr_info.format = vkd3d_internal_get_vk_format(device,
+                        vkd3d_structured_srv_to_texel_buffer_dxgi_format(desc->Buffer.StructureByteStride));
+
+                if (!addr_info.format)
+                {
+                    addr_info.address = 0u;
+                    addr_info.range = VK_WHOLE_SIZE;
+                }
             }
         }
     }
+
     VK_CALL(vkGetDescriptorEXT(device->vk_device, &get_info,
             device->device_info.descriptor_buffer_properties.robustUniformTexelBufferDescriptorSize,
             d.payload));
@@ -7283,6 +7298,9 @@ VkDeviceAddress vkd3d_get_acceleration_structure_device_address(struct d3d12_dev
     return VK_CALL(vkGetAccelerationStructureDeviceAddressKHR(device->vk_device, &address_info));
 }
 
+/* For DLSS integration. */
+extern VKD3D_THREAD_LOCAL struct D3D12_UAV_INFO *d3d12_uav_info;
+
 static void vkd3d_create_buffer_uav_heap(vkd3d_cpu_descriptor_va_t desc_va, struct d3d12_device *device,
         struct d3d12_resource *resource, struct d3d12_resource *counter_resource,
         const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc)
@@ -7332,11 +7350,24 @@ static void vkd3d_create_buffer_uav_heap(vkd3d_cpu_descriptor_va_t desc_va, stru
         memset(&view, 0, sizeof(view));
     }
 
+    if (d3d12_uav_info)
+    {
+        d3d12_uav_info->gpuVAStart = view.va;
+        d3d12_uav_info->gpuVASize = view.range;
+    }
+
     is_typed = desc->Format && !(desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW);
 
     can_emit_sibling_typed =
         bindless->packed_raw_buffer_offset >= bindless->heap.storage_texel_buffer_size && !counter_resource;
     can_emit_sibling_raw = bindless->packed_raw_buffer_offset >= bindless->heap.storage_texel_buffer_size;
+
+    if (bindless->flags & VKD3D_BINDLESS_NULL_BUFFER_SIBLINGS)
+    {
+        /* We'll get a cleared stack descriptor instead. For workaround purposes, this does what we need. */
+        can_emit_sibling_typed = false;
+        can_emit_sibling_raw = false;
+    }
 
     if (!is_typed && !d3d12_resource_desc_supports_heap_raw_uav_ssbo(device, desc))
     {
@@ -7447,6 +7478,9 @@ static void vkd3d_create_buffer_uav_embedded(vkd3d_cpu_descriptor_va_t desc_va, 
     struct d3d12_desc_split_embedded d;
     struct d3d12_desc_split_metadata m;
     VkDescriptorGetInfoEXT get_info;
+    bool emit_typed;
+    bool emit_ssbo;
+    bool is_typed;
 
     if (!desc)
     {
@@ -7478,15 +7512,20 @@ static void vkd3d_create_buffer_uav_embedded(vkd3d_cpu_descriptor_va_t desc_va, 
     if (m.view)
         m.view->info.buffer = view;
 
+    is_typed = desc->Format && !(desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW);
+    emit_typed = is_typed || !(device->bindless_state.flags & VKD3D_BINDLESS_NULL_BUFFER_SIBLINGS);
+    emit_ssbo = !is_typed || !(device->bindless_state.flags & VKD3D_BINDLESS_NULL_BUFFER_SIBLINGS);
+
     get_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT;
     get_info.pNext = NULL;
     get_info.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    get_info.data.pStorageBuffer = &addr_info;
+    get_info.data.pStorageBuffer = emit_ssbo ? &addr_info : NULL;
     addr_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT;
     addr_info.pNext = NULL;
     addr_info.address = view.va;
     addr_info.range = view.range;
     addr_info.format = VK_FORMAT_UNDEFINED;
+
     VK_CALL(vkGetDescriptorEXT(device->vk_device, &get_info,
             device->device_info.descriptor_buffer_properties.robustStorageBufferDescriptorSize,
             d.payload + device->bindless_state.packed_raw_buffer_offset));
@@ -7506,6 +7545,10 @@ static void vkd3d_create_buffer_uav_embedded(vkd3d_cpu_descriptor_va_t desc_va, 
         addr_info.address = counter_resource->res.va + desc->Buffer.CounterOffsetInBytes;
         addr_info.range = 4;
         addr_info.format = VK_FORMAT_R32_UINT;
+    }
+    else if (!emit_typed)
+    {
+        get_info.data.pStorageTexelBuffer = NULL;
     }
     else
     {
@@ -9066,6 +9109,13 @@ static HRESULT d3d12_descriptor_heap_create_descriptor_heap(struct d3d12_descrip
     else
     {
         alloc_size = device->bindless_state.sampler_size;
+
+        /* We have no reasonable way to pass down meta information about number of samplers.
+         * But we can clamp to 2047 which should work "everywhere". */
+        if (descriptor_heap->desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+            if (d3d12_descriptor_heap_require_padding_descriptors(device))
+                descriptor_count = max(descriptor_count, D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE);
+
         alloc_size *= descriptor_count;
 
         if (descriptor_heap->desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
@@ -9170,6 +9220,15 @@ static HRESULT d3d12_descriptor_heap_create_descriptor_buffer(struct d3d12_descr
             (descriptor_heap->desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
     {
         descriptor_count++;
+    }
+
+    /* We have no reasonable way to pass down meta information about number of samplers.
+     * But we can clamp to 2047 which should work "everywhere". */
+    if (descriptor_heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER &&
+        (descriptor_heap->desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+        d3d12_descriptor_heap_require_padding_descriptors(device))
+    {
+        descriptor_count = max(descriptor_count, D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE);
     }
 
     for (i = 0, set_count = 0; i < device->bindless_state.legacy.set_count; i++)
@@ -10156,6 +10215,12 @@ HRESULT d3d12_descriptor_heap_create(struct d3d12_device *device,
                 object->cpu_va.ptr = (SIZE_T)object->descriptor_buffer.host_allocation;
                 if (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
                     object->cpu_va.ptr += device->bindless_state.heap.redzone_size;
+
+                if ((desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device->vk_info.NVX_image_view_handle)
+                {
+                    vkd3d_va_map_insert_descriptor_heap(&device->memory_allocator.va_map, object->cpu_va.ptr,
+                        descriptor_size * desc->NumDescriptors, desc->Type);
+                }
             }
             else
             {
@@ -10259,6 +10324,15 @@ void d3d12_descriptor_heap_cleanup(struct d3d12_descriptor_heap *descriptor_heap
             }
             pthread_mutex_destroy(&descriptor_heap->meta_descriptor_lock);
             vkd3d_free(descriptor_heap->meta_descriptor_indices);
+        }
+
+        if (device->vk_info.NVX_image_view_handle &&
+            (descriptor_heap->desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+            (descriptor_heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+                descriptor_heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER))
+        {
+            vkd3d_va_map_remove_descriptor_heap(&device->memory_allocator.va_map,
+                descriptor_heap->cpu_va.ptr, descriptor_heap->desc.Type);
         }
     }
 

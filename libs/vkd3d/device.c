@@ -742,6 +742,17 @@ static const struct vkd3d_instance_application_meta application_override[] = {
      * but descriptor heap is not named, so we cannot auto-detect. Similar story for the PSOs. */
     { VKD3D_STRING_COMPARE_EXACT, "ArkAscended.exe",
         VKD3D_CONFIG_FLAG_INIT_STATIC(.RETAIN_PSOS = 1) },
+    /* Forza Horizon 6 (2483190).
+     * Completely broken case where it writes a texture descriptor and reads it as a buffer.
+     * With 32b embedded model on RDNA3/4, this causes a GPU hang.
+     * Lots of jank is needed to make this work:
+     * Co-siting buffers and images was attempted, but we ran into HW bugs.
+     * The only reasonable solution is to completely firewall images and buffers from each other by:
+     * - Forcing 64b descriptors on heap or rely on 64b drirc workaround in RADV for DB path.
+     * - Disable sibling descriptors. They cause some weird glitches which likely originate from
+     *   bad texel buffer <-> image aliasing. */
+    { VKD3D_STRING_COMPARE_EXACT, "forzahorizon6.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(
+        .AVOID_IMAGE_BUFFER_ALIASING = 1, .NULL_BUFFER_SIBLINGS = 1, .NO_STAGGERED_SUBMIT = 1) },
     { VKD3D_STRING_COMPARE_NEVER, NULL },
 };
 
@@ -842,6 +853,13 @@ static const struct vkd3d_shader_quirk_info witcher3_quirks = {
 
 static const struct vkd3d_shader_quirk_info heap_robustness_quirks = {
     NULL, 0, VKD3D_SHADER_QUIRK_DESCRIPTOR_HEAP_ROBUSTNESS,
+};
+
+static const struct vkd3d_shader_quirk_info forza6_quirks = {
+    NULL, 0,
+    /* Tons of OOB access in RT, even for sampler heap.
+     * Also, lots of missed nonuniformEXT in RT, so force that ... */
+    VKD3D_SHADER_QUIRK_DESCRIPTOR_HEAP_ROBUSTNESS | VKD3D_SHADER_QUIRK_FORCE_NONUNIFORM_RT,
 };
 
 static const struct vkd3d_shader_quirk_hash ac_mirage_hashes[] = {
@@ -1097,6 +1115,8 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     { VKD3D_STRING_COMPARE_ENDS_WITH, "-Shipping.exe", &ue4_quirks },
 	/* Spider Man 2 (2651280) */
     { VKD3D_STRING_COMPARE_EXACT, "Spider-Man2.exe", &spiderman2_quirks },
+    /* Forza Horizon 6 (2483190). */
+    { VKD3D_STRING_COMPARE_EXACT, "forzahorizon6.exe", &forza6_quirks },
     /* MSVC fails to compile empty array. */
     { VKD3D_STRING_COMPARE_NEVER, NULL, NULL },
 };
@@ -6247,6 +6267,8 @@ static void STDMETHODCALLTYPE d3d12_device_CreateShaderResourceView_default(d3d1
     d3d12_desc_create_srv(descriptor.ptr, device, impl_from_ID3D12Resource(resource), desc);
 }
 
+VKD3D_THREAD_LOCAL struct D3D12_UAV_INFO *d3d12_uav_info = NULL;
+
 static void STDMETHODCALLTYPE d3d12_device_CreateUnorderedAccessView_heap(d3d12_device_iface *iface,
         ID3D12Resource *resource, ID3D12Resource *counter_resource,
         const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
@@ -6260,7 +6282,33 @@ static void STDMETHODCALLTYPE d3d12_device_CreateUnorderedAccessView_heap(d3d12_
             device, d3d12_resource_,
             impl_from_ID3D12Resource(counter_resource), desc);
 
-    /* TODO: Plumb d3d12_uav_info through later. */
+    /* d3d12_uav_info stores the pointer to data from previous call to d3d12_device_vkd3d_ext_CaptureUAVInfo().
+     * Below code will update the data. */
+    if (d3d12_uav_info)
+    {
+        /* Buffer VAs are updated in vkd3d_create_buffer_uav_heap since we cannot rely on metadata. */
+
+        if (!desc || desc->ViewDimension != D3D12_UAV_DIMENSION_BUFFER)
+        {
+            d3d12_uav_info->surfaceHandle = d3d12_device_find_shader_visible_descriptor_heap_offset(device, descriptor.ptr,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+            if (d3d12_uav_info->surfaceHandle == UINT32_MAX)
+            {
+                /* Older DLSS DLLs call this on a CPU descriptor heap.
+                 * It's meaningless to report a heap index for these, but those DLLs expect
+                 * the index we return to at least be valid. Just return a dummy index that points
+                 * to the last redzone descriptor. We apparently have to return 0 here for it to work. */
+                d3d12_uav_info->surfaceHandle = 0;
+            }
+
+            /* Is this even used? */
+            d3d12_uav_info->gpuVAStart = 0;
+            d3d12_uav_info->gpuVASize = 0;
+        }
+
+        d3d12_uav_info = NULL;
+    }
 }
 
 static void STDMETHODCALLTYPE d3d12_device_CreateUnorderedAccessView_embedded(d3d12_device_iface *iface,
@@ -6278,8 +6326,6 @@ static void STDMETHODCALLTYPE d3d12_device_CreateUnorderedAccessView_embedded(d3
 
     /* Unknown at this time if we can support magic d3d12_uav_info with embedded mutable. */
 }
-
-VKD3D_THREAD_LOCAL struct D3D12_UAV_INFO *d3d12_uav_info = NULL;
 
 static void STDMETHODCALLTYPE d3d12_device_CreateUnorderedAccessView_default(d3d12_device_iface *iface,
         ID3D12Resource *resource, ID3D12Resource *counter_resource,
@@ -9525,12 +9571,16 @@ uint32_t d3d12_device_get_max_descriptor_heap_size(struct d3d12_device *device, 
             }
 
         case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER:
-            if (d3d12_device_use_descriptor_heap(device) && device->memory_info.has_gpu_upload_heap)
+            if (d3d12_device_use_descriptor_heap(device) && device->memory_info.has_gpu_upload_heap &&
+                !d3d12_descriptor_heap_require_padding_descriptors(device))
             {
                 /* Meta shaders need embedded samplers in some cases, so we cannot potentially expose the larger limits. */
                 VkDeviceSize useable_size =
                     device->device_info.descriptor_heap_properties.maxSamplerHeapSize -
                     device->device_info.descriptor_heap_properties.minSamplerHeapReservedRangeWithEmbedded;
+
+                /* For padding scenarios, we rely on allocating 2048 samplers for every heap
+                 * and clamp to 2047 since we cannot sneak in a proper redzone descriptor on NV. */
 
                 /* Don't report ridiculously large numbers here for safety. Limit the number of descriptors. */
                 uint32_t count = min(1000000, useable_size >> device->bindless_state.sampler_size_log2);
@@ -9916,8 +9966,9 @@ bool d3d12_device_supports_workgraphs(const struct d3d12_device *device)
 {
     /* Thread nodes currently need wave32 to function correctly since the API limits for thread nodes
      * match wave32 expectations (8 nodes per thread * 32 threads = 256 max nodes). */
-    return (VKD3D_CONFIG_FLAG_IS_SET(ENABLE_EXPERIMENTAL_FEATURES) /* ||
-            vkd3d_debug_control_is_test_suite() */) &&
+    return (VKD3D_CONFIG_FLAG_IS_SET(ENABLE_EXPERIMENTAL_FEATURES) ||
+            vkd3d_debug_control_is_test_suite()) &&
+            d3d12_device_use_descriptor_heap(device) &&
             device->device_info.shader_maximal_reconvergence_features.shaderMaximalReconvergence &&
             device->device_info.vulkan_1_2_features.vulkanMemoryModel &&
             device->device_info.vulkan_1_3_features.subgroupSizeControl &&

@@ -551,6 +551,9 @@ enum vkd3d_shader_target_extension
 /* Use precise fma instead of the spec correct mad. To workaround issues with invariance. */
 #define VKD3D_SHADER_QUIRK_PRECISE_FMA (1ull << 33)
 
+/* Forces nonuniformEXT for everything in RT. */
+#define VKD3D_SHADER_QUIRK_FORCE_NONUNIFORM_RT (1ull << 34)
+
 typedef uint64_t vkd3d_shader_quirks_t;
 
 struct vkd3d_shader_quirk_hash
@@ -1053,6 +1056,8 @@ struct vkd3d_shader_node_input_push_signature
     VkDeviceAddress local_root_signature_bda;
     uint32_t node_payload_output_offset;
     uint32_t node_remaining_recursion_levels;
+    /* Used by heap path. */
+    VkDeviceAddress root_parameter_bda;
 };
 
 struct vkd3d_shader_node_input_data

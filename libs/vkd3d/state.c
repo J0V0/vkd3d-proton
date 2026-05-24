@@ -953,9 +953,6 @@ static HRESULT d3d12_root_signature_init_root_descriptor_tables(struct d3d12_roo
             if (local_root_signature)
             {
                 vk_mapping->sourceData.shaderRecordIndex.heapArrayStride = bindless_state->sampler_size;
-                /* 1 is intentional. The SBT pointers are provided in terms of bytes.
-                 * The only requirement is that the final offset is aligned.
-                 * A stride of 1 is explicitly allowed by specification to support SBT cases like these. */
                 vk_mapping->sourceData.shaderRecordIndex.heapIndexStride = 1;
                 vk_mapping->sourceData.shaderRecordIndex.heapOffset = 0;
                 vk_mapping->sourceData.shaderRecordIndex.shaderRecordOffset = local_table_offset;
@@ -2051,69 +2048,6 @@ HRESULT d3d12_root_signature_create_local_static_samplers_layout(struct d3d12_ro
         return hr;
 
     *vk_pipeline_layout = bind_point_layout.vk_pipeline_layout;
-    return S_OK;
-}
-
-HRESULT d3d12_root_signature_create_work_graph_layout(struct d3d12_root_signature *root_signature,
-        VkDescriptorSetLayout *vk_push_set_layout, VkPipelineLayout *vk_pipeline_layout)
-{
-    VkDescriptorSetLayout set_layouts[VKD3D_MAX_DESCRIPTOR_SETS];
-    struct d3d12_bind_point_layout bind_point_layout;
-    VkDescriptorSetLayoutBinding binding;
-    VkPushConstantRange range;
-    bool uses_push_ubo;
-    HRESULT hr;
-
-    /* If we're already using push UBO block, we just need to modify the push range. */
-    /* TODO: Local sampler set. */
-    uses_push_ubo = !!(root_signature->compute.flags & VKD3D_ROOT_SIGNATURE_USE_PUSH_CONSTANT_UNIFORM_BLOCK);
-    range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    range.offset = 0;
-    range.size = sizeof(struct vkd3d_shader_node_input_push_signature);
-
-    if (root_signature->root_descriptor_push_mask)
-    {
-        FIXME("The root signature is already using push descriptors, cannot add another push descriptor set. Make sure to use VKD3D_CONFIG=force_raw_va_cbv on NVIDIA.\n");
-        return E_INVALIDARG;
-    }
-
-    if (uses_push_ubo || root_signature->compute.push_constant_range.size == 0)
-    {
-        if (FAILED(hr = vkd3d_create_pipeline_layout_for_stage_mask(
-                root_signature->device, root_signature->compute.num_set_layouts, root_signature->set_layouts,
-                &range, VK_SHADER_STAGE_COMPUTE_BIT, &bind_point_layout)))
-            return hr;
-
-        *vk_push_set_layout = VK_NULL_HANDLE;
-        *vk_pipeline_layout = bind_point_layout.vk_pipeline_layout;
-    }
-    else
-    {
-        binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        binding.descriptorCount = 1;
-        binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        binding.binding = 0;
-        binding.pImmutableSamplers = NULL;
-
-        memcpy(set_layouts, root_signature->set_layouts,
-                root_signature->compute.num_set_layouts * sizeof(VkDescriptorSetLayout));
-
-        if (FAILED(hr = vkd3d_create_descriptor_set_layout(
-                root_signature->device, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
-                1, &binding,
-                VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT, vk_push_set_layout)))
-            return hr;
-
-        set_layouts[root_signature->compute.num_set_layouts] = *vk_push_set_layout;
-
-        if (FAILED(hr = vkd3d_create_pipeline_layout_for_stage_mask(
-                root_signature->device, root_signature->compute.num_set_layouts + 1, set_layouts,
-                &range, VK_SHADER_STAGE_COMPUTE_BIT, &bind_point_layout)))
-            return hr;
-
-        *vk_pipeline_layout = bind_point_layout.vk_pipeline_layout;
-    }
-
     return S_OK;
 }
 
@@ -8076,6 +8010,16 @@ static HRESULT vkd3d_bindless_state_init_heap(struct vkd3d_bindless_state *bindl
             max(bindless_state->heap.storage_texel_buffer_size, bindless_state->heap.uniform_texel_buffer_size),
             device->device_info.descriptor_heap_properties.bufferDescriptorAlignment);
 
+    if (VKD3D_CONFIG_FLAG_IS_SET(AVOID_IMAGE_BUFFER_ALIASING))
+    {
+        /* Try to avoid direct aliasing to workaround horrible game bugs + AMD HW behavior which isn't as robust
+         * as we'd hope. Essentially, get RDNA2 64b desc behavior if possible.
+         * On NV/Intel, this path should do nothing. */
+        minimum_buffer_offset = max(bindless_state->heap.storage_image_size, minimum_buffer_offset);
+        minimum_buffer_offset = align(minimum_buffer_offset,
+            device->device_info.descriptor_heap_properties.bufferDescriptorAlignment);
+    }
+
     minimum_unified_buffer_descriptor_size_log2 = align(minimum_buffer_offset + bindless_state->heap.ssbo_size,
             max(device->device_info.descriptor_heap_properties.imageDescriptorAlignment,
                 device->device_info.descriptor_heap_properties.bufferDescriptorAlignment));
@@ -8088,7 +8032,8 @@ static HRESULT vkd3d_bindless_state_init_heap(struct vkd3d_bindless_state *bindl
     if ((1u << minimum_unified_buffer_descriptor_size_log2) * ((1 << 20) - (1 << 15)) <=
         device->device_info.descriptor_heap_properties.maxResourceHeapSize)
     {
-        bindless_state->cbv_srv_uav_size_log2 = minimum_unified_buffer_descriptor_size_log2;
+        bindless_state->cbv_srv_uav_size_log2 =
+            max(minimum_unified_buffer_descriptor_size_log2, bindless_state->cbv_srv_uav_size_log2);
         unified_buffer_descriptor = true;
     }
 
@@ -8349,9 +8294,14 @@ HRESULT vkd3d_bindless_state_init(struct vkd3d_bindless_state *bindless_state,
         return E_NOTIMPL;
     }
 
-    if (SUCCEEDED(vkd3d_bindless_state_init_heap(bindless_state, device)))
-        return S_OK;
-    return vkd3d_bindless_state_init_legacy(bindless_state, device);
+    if (FAILED(vkd3d_bindless_state_init_heap(bindless_state, device)))
+        if (FAILED(vkd3d_bindless_state_init_legacy(bindless_state, device)))
+            return E_NOTIMPL;
+
+    if (VKD3D_CONFIG_FLAG_IS_SET(NULL_BUFFER_SIBLINGS))
+        bindless_state->flags |= VKD3D_BINDLESS_NULL_BUFFER_SIBLINGS;
+
+    return S_OK;
 }
 
 void vkd3d_bindless_state_cleanup(struct vkd3d_bindless_state *bindless_state,
